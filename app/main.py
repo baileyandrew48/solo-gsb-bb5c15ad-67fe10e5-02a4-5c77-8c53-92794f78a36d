@@ -10,6 +10,8 @@ POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为
 POST /plans/{plan_id}/glaze-separation   釉色隔离：提交互斥对，只读重求最少窑次建议
 POST /plans/{plan_id}/kilns/{index}/temperature-check
                                            窑次温控核验：求落在合格温区内的最长连续时段
+POST /plans/{plan_id}/kilns/{index}/shelf-placement
+                                           窑内层位安排：最大化器物到温区边界的最小温差
 POST /plans/{plan_id}/firing-order       单台实体窑点火排程：全部批次不逾期的最早整体完工
 POST /plans/{plan_id}/cost-allocation    烧成费用分摊：每窑按器物体积比例（受上限约束）分摊费用
 GET  /health                             健康检查
@@ -29,6 +31,10 @@ from .firing import (
     FiringBatch,
     NoFeasibleFiringOrderError,
     earliest_firing_schedule,
+)
+from .shelf_placement import (
+    NoFeasibleShelfPlacementError,
+    optimal_shelf_placement,
 )
 from .schemas import (
     AppendItemsIn,
@@ -55,6 +61,9 @@ from .schemas import (
     PlanOut,
     ProductionLimitIn,
     ProductionLimitOut,
+    ShelfPlacementIn,
+    ShelfPlacementItemOut,
+    ShelfPlacementOut,
     TemperatureCheckIn,
     TemperatureCheckOut,
 )
@@ -116,6 +125,16 @@ def _insufficient_cap_handler(
     return JSONResponse(
         status_code=400,
         content={"error": "INSUFFICIENT_CAP_SUM", "message": str(exc)},
+    )
+
+
+@app.exception_handler(NoFeasibleShelfPlacementError)
+def _no_feasible_shelf_placement_handler(
+    _: Request, exc: NoFeasibleShelfPlacementError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "NO_FEASIBLE_SHELF_PLACEMENT", "message": str(exc)},
     )
 
 
@@ -708,6 +727,89 @@ def temperature_check(
         end=format_fraction(result.end),
         duration_seconds=format_fraction(result.duration),
         meets_requirement=result.meets_requirement,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/kilns/{index}/shelf-placement",
+    response_model=ShelfPlacementOut,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "层位数量与该窑器物数不一致 / 无完整可行分配",
+        },
+        404: {"model": ErrorOut, "description": "方案或窑次不存在"},
+    },
+    summary="窑内层位安排：最大化器物到温区边界的最小温差",
+)
+def shelf_placement(
+    plan_id: str, index: int, payload: ShelfPlacementIn
+) -> ShelfPlacementOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    kilns = sorted(plan["kilns"], key=lambda k: k["index"])
+    if not 1 <= index <= len(kilns):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "KILN_NOT_FOUND",
+                "message": (
+                    f"方案 {plan_id} 共 {len(kilns)} 个窑次，"
+                    f"窑次序号须为 1～{len(kilns)}: {index}"
+                ),
+            },
+        )
+    kiln = kilns[index - 1]
+
+    item_count = len(kiln["item_ids"])
+    if len(payload.shelves) != item_count:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "SHELF_COUNT_MISMATCH",
+                "message": (
+                    f"窑次 {index} 共 {item_count} 件器物，"
+                    f"层位数量须与器物数相同: {len(payload.shelves)}"
+                ),
+            },
+        )
+
+    # 以方案保存的该窑器物温区与烧成温度为准，只读计算，不改写原方案。
+    # 无完整可行分配时 shelf_placement 模块抛出
+    # NoFeasibleShelfPlacementError，由全局处理器返回 400。
+    by_id = {it["item_id"]: it for it in plan["items"]}
+    items = [
+        (item_id, by_id[item_id]["temp_low"], by_id[item_id]["temp_high"])
+        for item_id in kiln["item_ids"]
+    ]
+    shelves = [(s.shelf_id, s.temp_offset) for s in payload.shelves]
+
+    result = optimal_shelf_placement(items, kiln["firing_temp"], shelves)
+
+    return ShelfPlacementOut(
+        plan_id=plan["id"],
+        kiln_index=kiln["index"],
+        firing_temp=kiln["firing_temp"],
+        min_temp_margin=result.min_temp_margin,
+        placements=[
+            ShelfPlacementItemOut(
+                item_id=it.item_id,
+                shelf_id=it.shelf_id,
+                temp_offset=it.temp_offset,
+                actual_temp=it.actual_temp,
+                temp_margin=it.temp_margin,
+            )
+            for it in result.items
+        ],
     )
 
 

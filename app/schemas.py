@@ -533,3 +533,71 @@ class CostAllocationOut(BaseModel):
     items: list[ItemCostOut] = Field(
         ..., description="每件器物的费用汇总，按器物编号升序"
     )
+
+
+class ShelfIn(BaseModel):
+    """一个层位：唯一编号与整数温度偏移。"""
+
+    shelf_id: str = Field(..., min_length=1, description="层位唯一编号（非空字符串）")
+    temp_offset: int = Field(
+        ..., strict=True, description="相对窑烧成温度的整数温度偏移（可正可负）"
+    )
+
+    @field_validator("shelf_id")
+    @classmethod
+    def _strip_and_check(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("层位编号不得为空白字符串")
+        return v
+
+
+class ShelfPlacementIn(BaseModel):
+    """窑内层位安排请求：层位数量须与该窑器物数相同。"""
+
+    shelves: list[ShelfIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="层位列表：数量须等于该窑器物数，编号唯一，温度偏移为整数",
+    )
+
+    @model_validator(mode="after")
+    def _unique_shelf_ids(self):
+        seen: set[str] = set()
+        dup: list[str] = []
+        for s in self.shelves:
+            if s.shelf_id in seen and s.shelf_id not in dup:
+                dup.append(s.shelf_id)
+            seen.add(s.shelf_id)
+        if dup:
+            raise ValueError(f"层位编号必须唯一，重复编号: {', '.join(dup)}")
+        return self
+
+
+class ShelfPlacementItemOut(BaseModel):
+    """一件器物的层位安排。"""
+
+    item_id: str = Field(..., description="器物编号")
+    shelf_id: str = Field(..., description="所配层位编号")
+    temp_offset: int = Field(..., description="该层位的整数温度偏移")
+    actual_temp: int = Field(
+        ..., description="入位后的实际温度 = 窑烧成温度 + 层位温度偏移"
+    )
+    temp_margin: int = Field(
+        ..., description="实际温度到该器物温区最近边界的温差（非负整数）"
+    )
+
+
+class ShelfPlacementOut(BaseModel):
+    """窑内层位安排结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="方案 ID")
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    firing_temp: int = Field(..., description="该窑烧成温度（取自原方案）")
+    min_temp_margin: int = Field(
+        ..., description="全部器物到各自温区最近边界温差的最小值（已最大化）"
+    )
+    placements: list[ShelfPlacementItemOut] = Field(
+        ..., description="逐件层位安排，按器物编号升序"
+    )
